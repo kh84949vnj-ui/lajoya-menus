@@ -1,0 +1,3 @@
+output/pdfs/
+*.tmp
+__pycache__/
