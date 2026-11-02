@@ -1,352 +1,116 @@
 #!/usr/bin/env python3
-"""Download La Joya ISD CNS menu PDFs and convert their calendar grids to CSV.
+"""Download La Joya ISD High School menu PDFs and save them as output/menus.csv.
 
-Output CSV columns: date, weekday, breakfast, lunch
-
-Usage:
-    python lajoya_menus.py [--out-dir DIR] [--url PAGE_URL] [-v]
-    python lajoya_menus.py --parse-only some.pdf [other.pdf ...]   # no network
+In each day's box, breakfast is printed in red and lunch in black.
 """
-import argparse
-import calendar
 import csv
 import datetime as dt
-import logging
 import re
-import sys
 from pathlib import Path
-from urllib.parse import urljoin
 
 import pdfplumber
 import requests
-from bs4 import BeautifulSoup
 
-PAGE_URL = "https://lajoyaisdcns.com/index.php?page=menus&sid=0208131445498761"
-USER_AGENT = "Mozilla/5.0 (menu-to-csv script)"
-
-log = logging.getLogger("lajoya_menus")
-
-WEEKDAYS = {
-    "monday": 0, "mon": 0, "lunes": 0,
-    "tuesday": 1, "tue": 1, "tues": 1, "martes": 1,
-    "wednesday": 2, "wed": 2, "miercoles": 2, "miércoles": 2,
-    "thursday": 3, "thu": 3, "thur": 3, "thurs": 3, "jueves": 3,
-    "friday": 4, "fri": 4, "viernes": 4,
-    "saturday": 5, "sat": 5, "sunday": 6, "sun": 6,
-}
-MONTHS = {m.lower(): i for i, m in enumerate(calendar.month_name) if m}
-MONTHS.update({m.lower(): i for i, m in enumerate(calendar.month_abbr) if m})
-MONTHS.update({"sept": 9, "enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5,
-               "junio": 6, "julio": 7, "agosto": 8, "septiembre": 9, "octubre": 10,
-               "noviembre": 11, "diciembre": 12})
-MEAL_SPLIT_RE = re.compile(r"(?i)\b(breakfast|desayuno|lunch|almuerzo)\b\s*:?")
-DAY_RE = re.compile(r"^\s*(\d{1,2})(?:st|nd|rd|th)?\b[.:)\-]?\s*(.*)$", re.S)
+SITE = "https://lajoyaisdcns.com"
+MENUS_PAGE = SITE + "/index.php?sid=0208131445498761&page=menus&sm={month}&sy={year}"
+WHICH_MENU = "High School"
+OUT = Path(__file__).resolve().parent / "output"
+CSV_PATH = OUT / "menus.csv"
 
 
-# --------------------------------------------------------------------------- fetch
-
-def find_menu_links(session, page_url):
-    """Return [(absolute_url, link_text)] for every downloadMenu.php link on the page."""
-    resp = session.get(page_url, timeout=30)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
-    links, seen = [], set()
-    for a in soup.find_all("a", href=True):
-        if "downloadmenu.php" not in a["href"].lower():
-            continue
-        url = urljoin(page_url, a["href"])
-        if url in seen:
-            continue
-        seen.add(url)
-        text = " ".join(a.get_text(" ", strip=True).split()) or a.get("title", "")
-        links.append((url, text))
-    return links
+def menu_links(month, year):
+    html = requests.get(MENUS_PAGE.format(month=month, year=year), timeout=30).text
+    links = re.findall(r'href="(/downloadMenu\.php/[^"]+)"[^>]*>([^<]+)', html)
+    return [SITE + href for href, title in links if WHICH_MENU.lower() in title.lower()]
 
 
-def download_pdf(session, url, dest_dir):
-    """Download url (following redirects) into dest_dir; return the saved path."""
-    resp = session.get(url, timeout=60, allow_redirects=True)
-    resp.raise_for_status()
-    if not resp.content.startswith(b"%PDF"):
-        raise ValueError(f"{url} did not return a PDF (content-type {resp.headers.get('content-type')})")
-    menu_id = url.rstrip("/").rsplit("/", 1)[-1]
-    name = Path(resp.url.split("?")[0]).name
-    if not name.lower().endswith(".pdf"):
-        name = "menu.pdf"
-    path = dest_dir / f"{menu_id}_{re.sub(r'[^A-Za-z0-9._-]+', '_', name)}"
-    path.write_bytes(resp.content)
-    return path
+def is_red(word):
+    color = word.get("non_stroking_color") or ()
+    return len(color) == 3 and color[0] > 0.6 and color[1] < 0.4 and color[2] < 0.4
 
 
-# --------------------------------------------------------------------------- parse
-
-def guess_meal(*texts):
-    """'breakfast', 'lunch', or None (combined / unknown) from labels and PDF text."""
-    for text in texts:
-        t = (text or "").lower()
-        b = "breakfast" in t or "desayuno" in t
-        l = "lunch" in t or "almuerzo" in t
-        if b != l:
-            return "breakfast" if b else "lunch"
-    return None
+def clusters(values, gap=10):
+    """Group nearly equal positions (the left edges of columns, the tops of rows)."""
+    groups = []
+    for v in sorted(values):
+        if not groups or v - groups[-1] > gap:
+            groups.append(v)
+    return groups
 
 
-def guess_month_year(*texts, today=None):
-    """Find 'October 2026' style month/year. Falls back to the nearest plausible year."""
-    today = today or dt.date.today()
-    month = year = None
-    for text in texts:
-        if not text:
-            continue
-        for m in re.finditer(r"(?i)\b([a-zé]{3,10})\.?,?\s*(?:de\s+)?(20\d\d)?\b", text):
-            mo = MONTHS.get(m.group(1).lower())
-            if mo:
-                month = month or mo
-                if m.group(2) and mo == month:
-                    year = int(m.group(2))
-                    break
-        if month and year:
-            break
-    if month and not year:
-        # School-year menus: pick the year that puts the month closest to today.
-        year = min((today.year - 1, today.year, today.year + 1),
-                   key=lambda y: abs((dt.date(y, month, 15) - today).days))
-    return month, year
-
-
-def clean_text(text):
-    lines = [" ".join(l.split()) for l in (text or "").splitlines()]
-    return "; ".join(l for l in lines if l)
-
-
-def split_meals(text):
-    """Split combined cell text into {'breakfast': ..., 'lunch': ...} using labels."""
-    parts = MEAL_SPLIT_RE.split(text)
-    if len(parts) == 1:
-        return {}
-    out = {}
-    for label, body in zip(parts[1::2], parts[2::2]):
-        key = "breakfast" if label.lower() in ("breakfast", "desayuno") else "lunch"
-        out[key] = clean_text(body)
-    return out
-
-
-def _valid_day(day, weekday, month, year):
-    try:
-        d = dt.date(year, month, day)
-    except ValueError:
-        return None
-    return d if weekday is None or d.weekday() == weekday else None
-
-
-def _header_weekdays(row):
-    """Map column index -> weekday number if this row looks like a weekday header."""
-    cols = {}
-    for i, cell in enumerate(row):
-        word = re.sub(r"[^a-záéíóú]", "", (cell or "").lower())
-        if word in WEEKDAYS:
-            cols[i] = WEEKDAYS[word]
-    return cols if len(cols) >= 3 else None
-
-
-def parse_tables(page, month, year):
-    """Strategy 1: ruled table grid. Returns {date: cell_text}."""
-    cells = {}
-    for table in page.extract_tables():
-        header = None
-        for row in table:
-            hdr = _header_weekdays(row)
-            if hdr:
-                header = hdr
-                continue
-            if not header:
-                continue
-            for i, cell in enumerate(row):
-                m = DAY_RE.match(cell or "")
-                if i not in header or not m:
-                    continue
-                d = _valid_day(int(m.group(1)), header[i], month, year)
-                if d:
-                    cells[d] = m.group(2)
-    return cells
-
-
-def parse_words(page, month, year):
-    """Strategy 2: position-based grid (no ruling lines). Returns {date: cell_text}."""
-    words = page.extract_words(keep_blank_chars=False, use_text_flow=False)
-    headers = []
-    for w in words:
-        key = re.sub(r"[^a-záéíóú]", "", w["text"].lower())
-        if key in WEEKDAYS and len(key) >= 3:
-            headers.append(((w["x0"] + w["x1"]) / 2, w["bottom"], WEEKDAYS[key]))
-    if len(headers) < 3:
-        return {}
-    # Keep the header row (most common y position) only.
-    ys = [round(h[1]) for h in headers]
-    hdr_y = max(set(ys), key=ys.count)
-    headers = sorted({h[2]: h for h in headers if abs(h[1] - hdr_y) < 5}.values())
-    centers = [h[0] for h in headers]
-    bounds = [-1e9] + [(a + b) / 2 for a, b in zip(centers, centers[1:])] + [1e9]
-
-    def col_of(x):
-        for i in range(len(centers)):
-            if bounds[i] <= x < bounds[i + 1]:
-                return i
-        return None
-
-    # Day numbers: integer tokens whose value matches the column's weekday this month.
-    day_marks = []  # (top, col, date)
-    for w in words:
-        if w["top"] <= hdr_y or not re.fullmatch(r"\d{1,2}", w["text"]):
-            continue
-        c = col_of((w["x0"] + w["x1"]) / 2)
-        if c is None:
-            continue
-        d = _valid_day(int(w["text"]), headers[c][2], month, year)
-        if d:
-            day_marks.append((w["top"], c, d, w))
-    # A menu item like "1 Milk" can also match; the real day label is the topmost one.
-    first = {}
-    for m in sorted(day_marks, key=lambda m: m[0]):
-        first.setdefault(m[2], m)
-    day_marks = list(first.values())
-    if not day_marks:
-        return {}
-    # Row tops = clusters of day-number tops.
-    row_tops = []
-    for top in sorted(m[0] for m in day_marks):
-        if not row_tops or top - row_tops[-1] > 8:
-            row_tops.append(top)
-    row_tops.append(page.height)
-
-    cells = {}
-    for top, c, d, mark in day_marks:
-        r = max(i for i, t in enumerate(row_tops[:-1]) if t <= top + 8)
-        y0, y1 = row_tops[r] - 2, row_tops[r + 1] - 2
-        x0, x1 = bounds[c], bounds[c + 1]
-        in_cell = [w for w in words if w is not mark and y0 <= w["top"] < y1
-                   and x0 <= (w["x0"] + w["x1"]) / 2 < x1]
-        lines = {}
-        for w in sorted(in_cell, key=lambda w: (round(w["top"]), w["x0"])):
-            lines.setdefault(round(w["top"] / 3), []).append(w["text"])
-        cells[d] = "\n".join(" ".join(v) for _, v in sorted(lines.items()))
-    return cells
-
-
-def parse_pdf(path, label="", today=None):
-    """Return (meal, {date: {'breakfast': str, 'lunch': str}}) for one menu PDF."""
-    with pdfplumber.open(path) as pdf:
-        full_text = "\n".join(p.extract_text() or "" for p in pdf.pages)
-        month, year = guess_month_year(label, full_text, today=today)
-        if not month:
-            log.warning("%s: could not determine month; skipping", path)
-            return None, {}
-        meal = guess_meal(label, full_text[:500])
-        cells = {}
-        for page in pdf.pages:
-            found = parse_tables(page, month, year)
-            if len(found) < 5:  # table extraction missed the grid; try word positions
-                alt = parse_words(page, month, year)
-                if len(alt) > len(found):
-                    found = alt
-            cells.update(found)
-    result = {}
-    for d, text in cells.items():
-        split = split_meals(text)
-        if split:
-            result[d] = split
-        elif meal:
-            result[d] = {meal: clean_text(text)}
+def join_lines(lines):
+    """Rejoin dishes that wrapped onto two lines, e.g. 'Beef Steak Fingers' + 'w/ Biscuit'."""
+    items = []
+    for line in lines:
+        if items and (line.startswith(("w/", "&")) or items[-1].endswith(("w/", "&"))):
+            items[-1] += " " + line
         else:
-            result[d] = {"lunch": clean_text(text)}  # unlabeled: assume lunch
-    log.info("%s: %s %d-%02d, %d days", Path(path).name, meal or "combined", year, month, len(result))
-    return meal, result
+            items.append(line)
+    return "; ".join(items)
 
 
-# --------------------------------------------------------------------------- csv
+def parse_pdf(pdf_bytes, path):
+    path.write_bytes(pdf_bytes)
+    with pdfplumber.open(path) as pdf:
+        page = pdf.pages[0]
+        month_name, year = re.search(r"([A-Z][a-z]+) (20\d\d)", page.extract_text()).groups()
+        month = dt.datetime.strptime(month_name, "%B").month
+        words = page.extract_words(extra_attrs=["non_stroking_color"])
 
-FIELDS = ["date", "weekday", "breakfast", "lunch"]
+    # Each day's box starts with a two-digit day number in its top-left corner.
+    days = [w for w in words if re.fullmatch(r"\d\d", w["text"]) and int(w["text"]) <= 31]
+    col_starts = clusters(w["x0"] for w in days)
+    row_tops = clusters(w["top"] for w in days)
+    row_tops.append(row_tops[-1] + (row_tops[-1] - row_tops[-2]))  # bottom of the last row
+    col_starts.append(col_starts[-1] + (col_starts[-1] - col_starts[-2]))
+
+    menus = {}
+    for day in days:
+        c = max(i for i, x in enumerate(col_starts) if x <= day["x0"] + 5)
+        r = max(i for i, y in enumerate(row_tops) if y <= day["top"] + 5)
+        x0, x1 = col_starts[c] - 2, col_starts[c + 1] - 2
+        y0, y1 = row_tops[r] - 14, row_tops[r + 1] - 14
+        lines = {}
+        for w in words:
+            if w is not day and x0 <= w["x0"] < x1 and y0 <= w["top"] < y1:
+                lines.setdefault(round(w["top"] / 4), []).append(w)
+        breakfast, lunch = [], []
+        for _, line in sorted(lines.items()):
+            line.sort(key=lambda w: w["x0"])
+            text = " ".join(w["text"] for w in line)
+            text = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", text)  # "ButterymapleWaffle" -> "Butterymaple Waffle"
+            # Red lines at the top of the box are breakfast; everything after is lunch.
+            if is_red(line[0]) and not lunch:
+                breakfast.append(text)
+            else:
+                lunch.append(text)
+        date = dt.date(int(year), month, int(day["text"]))
+        menus[date] = {"breakfast": join_lines(breakfast), "lunch": join_lines(lunch)}
+    return menus
 
 
-def load_csv(path):
+def main():
+    OUT.mkdir(exist_ok=True)
     rows = {}
-    if path.exists():
-        with path.open(newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                rows[dt.date.fromisoformat(row["date"])] = {
-                    "breakfast": row.get("breakfast", ""), "lunch": row.get("lunch", "")}
-    return rows
+    if CSV_PATH.exists():  # keep earlier months after they leave the website
+        with CSV_PATH.open(newline="", encoding="utf-8") as f:
+            rows = {dt.date.fromisoformat(r["date"]): r for r in csv.DictReader(f)}
 
+    first = dt.date.today().replace(day=1)
+    last_month, next_month = first - dt.timedelta(days=1), first + dt.timedelta(days=32)
+    for d in (last_month, first, next_month):
+        for url in menu_links(d.month, d.year):
+            pdf = requests.get(url, timeout=60).content
+            for date, meals in parse_pdf(pdf, OUT / "latest.pdf").items():
+                rows[date] = {"date": date.isoformat(), "weekday": date.strftime("%A"), **meals}
+            print(f"read {url}")
 
-def write_csv(path, rows):
-    tmp = path.with_suffix(".tmp")
-    with tmp.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=FIELDS)
-        w.writeheader()
-        for d in sorted(rows):
-            w.writerow({"date": d.isoformat(), "weekday": d.strftime("%A"),
-                        "breakfast": rows[d].get("breakfast", ""),
-                        "lunch": rows[d].get("lunch", "")})
-    tmp.replace(path)
-
-
-def merge(rows, parsed):
-    for d, meals in parsed.items():
-        slot = rows.setdefault(d, {"breakfast": "", "lunch": ""})
-        for k, v in meals.items():
-            if v:
-                slot[k] = v
-
-
-# --------------------------------------------------------------------------- main
-
-def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--url", default=PAGE_URL)
-    ap.add_argument("--out-dir", type=Path, default=Path(__file__).resolve().parent / "output")
-    ap.add_argument("--parse-only", nargs="+", type=Path, metavar="PDF",
-                    help="parse local PDFs instead of downloading")
-    ap.add_argument("-v", "--verbose", action="store_true")
-    args = ap.parse_args(argv)
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
-                        format="%(asctime)s %(levelname)s %(message)s")
-
-    pdf_dir = args.out_dir / "pdfs"
-    pdf_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = args.out_dir / "menus.csv"
-    rows = load_csv(csv_path)  # keep earlier months once they drop off the site
-
-    if args.parse_only:
-        sources = [(p, p.stem) for p in args.parse_only]
-    else:
-        session = requests.Session()
-        session.headers["User-Agent"] = USER_AGENT
-        links = find_menu_links(session, args.url)
-        log.info("found %d menu links", len(links))
-        if not links:
-            log.error("no downloadMenu.php links found on %s", args.url)
-            return 1
-        sources = []
-        for url, text in links:
-            try:
-                sources.append((download_pdf(session, url, pdf_dir), text))
-            except Exception as e:  # one bad link shouldn't kill the run
-                log.warning("download failed for %s: %s", url, e)
-
-    parsed_any = False
-    for path, label in sources:
-        try:
-            _, parsed = parse_pdf(path, label)
-        except Exception as e:
-            log.warning("parse failed for %s: %s", path, e)
-            continue
-        parsed_any |= bool(parsed)
-        merge(rows, parsed)
-
-    write_csv(csv_path, rows)
-    log.info("wrote %d rows to %s", len(rows), csv_path)
-    return 0 if parsed_any else 2
+    with CSV_PATH.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["date", "weekday", "breakfast", "lunch"])
+        writer.writeheader()
+        writer.writerows(rows[d] for d in sorted(rows))
+    print(f"{len(rows)} days in {CSV_PATH}")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

@@ -1,3 +1,2 @@
-output/pdfs/
-*.tmp
+output/latest.pdf
 __pycache__/
