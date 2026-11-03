@@ -17,11 +17,11 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
-      - run: python lajoya_menus.py --out-dir output
+      - run: python lajoya_menus.py
       - name: Commit CSV if it changed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898333+github-actions[bot]@users.noreply.github.com"
-          git add output/menus.csv
+          git add output/
           git diff --cached --quiet || git commit -m "Update menus $(date -u +%F)"
           git push
