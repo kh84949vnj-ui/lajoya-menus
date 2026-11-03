@@ -42,7 +42,7 @@ def join_lines(lines):
     """Rejoin dishes that wrapped onto two lines, e.g. 'Beef Steak Fingers' + 'w/ Biscuit'."""
     items = []
     for line in lines:
-        if items and (line.startswith(("w/", "&")) or items[-1].endswith(("w/", "&"))):
+        if items and (line.startswith(("w/", "&")) or items[-1].endswith(("w/", "&")) or items[-1].split()[-1].startswith("w/")):
             items[-1] += " " + line
         else:
             items.append(line)
