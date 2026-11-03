@@ -17,6 +17,18 @@ WHICH_MENU = "High School"
 OUT = Path(__file__).resolve().parent / "output"
 CSV_PATH = OUT / "menus.csv"
 
+# Typos in the district's PDFs, and dishes the PDF wraps onto two lines. Add more as you spot them.
+FIXES = {
+    "Cheses Steak; Nachos": "Cheese Steak Nachos",
+    "Cheery Blossom": "Cherry Blossom",
+    "Cherry Blossom; Chicken": "Cherry Blossom Chicken",
+    "Butterymaple Waffle": "Buttery Maple Waffle",
+    "Buttermaple Waffle": "Buttery Maple Waffle",
+    "w/Garlic": "w/ Garlic",
+    "Strawberry Ice; Cream Sunday": "Strawberry Ice Cream Sundae",
+    "Frozen Fruit; Slushies": "Frozen Fruit Slushies",
+}
+
 
 def menu_links(month, year):
     html = requests.get(MENUS_PAGE.format(month=month, year=year), timeout=30).text
@@ -46,7 +58,10 @@ def join_lines(lines):
             items[-1] += " " + line
         else:
             items.append(line)
-    return "; ".join(items)
+    text = "; ".join(items)
+    for wrong, right in FIXES.items():
+        text = text.replace(wrong, right)
+    return text
 
 
 def parse_pdf(pdf_bytes, path):
