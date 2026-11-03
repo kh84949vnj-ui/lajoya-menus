@@ -110,6 +110,23 @@ def main():
         writer.writeheader()
         writer.writerows(rows[d] for d in sorted(rows))
     print(f"{len(rows)} days in {CSV_PATH}")
+    write_weeks(rows)
+
+
+def write_weeks(rows):
+    """One file per school week, laid out like the Canva table: weekdays, breakfast row, lunch row."""
+    weeks_dir = OUT / "weeks"
+    weeks_dir.mkdir(exist_ok=True)
+    mondays = sorted({d - dt.timedelta(days=d.weekday()) for d in rows})
+    for monday in mondays:
+        days = [monday + dt.timedelta(days=i) for i in range(5)]
+        cell = lambda d, meal: rows[d][meal].replace("; ", "\n") if d in rows else ""
+        with (weeks_dir / f"{monday.isoformat()}.csv").open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([d.strftime("%A") for d in days])
+            writer.writerow([cell(d, "breakfast") for d in days])
+            writer.writerow([cell(d, "lunch") for d in days])
+    print(f"{len(mondays)} weekly tables in {weeks_dir}")
 
 
 if __name__ == "__main__":
