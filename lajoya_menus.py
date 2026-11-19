@@ -27,6 +27,8 @@ FIXES = {
     "w/Garlic": "w/ Garlic",
     "Strawberry Ice; Cream Sunday": "Strawberry Ice Cream Sundae",
     "Frozen Fruit; Slushies": "Frozen Fruit Slushies",
+    "Chili & Cheese; Hot Dog": "Chili & Cheese Hot Dog",
+    "Garlic; Breadstick": "Garlic Breadstick",
 }
 
 
